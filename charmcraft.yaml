@@ -59,6 +59,23 @@ requires:
   hydra-token-hook:
     interface: hydra_token_hook
     optional: true
+  send-security-otlp:
+    interface: security_otlp
+    optional: true
+    description: |
+      Send security-relevant logs directly to a SecOps-owned log-aggregator-k8s instance,
+      bypassing the general COS/otlp pipeline. Unbounded -- a source charm may relate to
+      more than one log-aggregator-k8s instance at once.
+  receive-ca-cert:
+    interface: certificate_transfer
+    optional: true
+    description: |
+      TEST SCAFFOLDING, not a production requirement -- see STATUS.md "Path B". Lets the
+      e2e harness's self-signed CA reach this workload container, so send-security-otlp's
+      log forwarding can be exercised end to end before lego-base-k8s/Let's Encrypt is
+      wired up on the provider side (the decided design that should make this relation
+      unnecessary for hydra). Remove once that path is validated, or once hydra needs
+      receive-ca-cert for an unrelated reason.
 
 provides:
   hydra-endpoint-info:
@@ -312,5 +329,10 @@ parts:
   charm:
     plugin: uv
     source: .
+    # git is required in the build container because charmlibs-interfaces-security-otlp
+    # is declared as a git+https dependency; uv shells out to git to fetch it. Can be
+    # dropped once that dependency moves to a published PyPI version pin.
+    build-packages:
+      - git
     build-snaps:
       - astral-uv

@@ -12,6 +12,10 @@ from secrets import token_hex
 from typing import Any
 
 from charmlibs.interfaces.oauth import OAuthProvider
+from charmlibs.interfaces.security_otlp import SecurityOtlpRequirer
+from charms.certificate_transfer_interface.v1.certificate_transfer import (
+    CertificateTransferRequires,
+)
 from charms.data_platform_libs.v0.data_interfaces import (
     DatabaseCreatedEvent,
     DatabaseRequires,
@@ -51,6 +55,7 @@ from cli import CommandLine, OAuthClient
 from configs import CharmConfig, ConfigFile
 from constants import (
     ADMIN_PORT,
+    CERTIFICATE_TRANSFER_INTEGRATION_NAME,
     COOKIE_SECRET,
     DATABASE_INTEGRATION_NAME,
     DEFAULT_OAUTH_SCOPES,
@@ -64,9 +69,11 @@ from constants import (
     PEER_INTEGRATION_NAME,
     PROMETHEUS_SCRAPE_INTEGRATION_NAME,
     PUBLIC_ROUTE_INTEGRATION_NAME,
+    SECURITY_OTLP_INTEGRATION_NAME,
     SYSTEM_SECRET,
     TEMPO_TRACING_INTEGRATION_NAME,
     WORKLOAD_CONTAINER,
+    WORKLOAD_SERVICE,
 )
 from exceptions import (
     ClientDoesNotExistError,
@@ -80,7 +87,9 @@ from integrations import (
     LoginUIEndpointData,
     PeerData,
     PublicRouteData,
+    TLSCertificates,
     TracingData,
+    configure_security_otlp_log_forwarding,
 )
 from oauth import OAuthReconciler
 from secret import HydraSecrets, Secrets
@@ -182,6 +191,19 @@ class HydraCharm(CharmBase):
         # Loki logging relation
         self._log_forwarder = LogForwarder(self, relation_name=LOGGING_RELATION_NAME)
 
+        # security-otlp: a separate, SecOps-owned log path, bypassing COS. Pebble only
+        # speaks OTLP/HTTP for log forwarding (no gRPC), so only "http" is requested.
+        self.security_otlp_requirer = SecurityOtlpRequirer(
+            self, relation_name=SECURITY_OTLP_INTEGRATION_NAME, protocols=["http"]
+        )
+
+        # TEST SCAFFOLDING, not production -- see STATUS.md "Path B" / TLSCertificates.
+        # Lets the e2e harness push a self-signed CA into this workload container so
+        # send-security-otlp's delivery path can be exercised end to end.
+        self.certificate_transfer_requirer = CertificateTransferRequires(
+            self, CERTIFICATE_TRANSFER_INTEGRATION_NAME
+        )
+
         self._grafana_dashboards = GrafanaDashboardProvider(
             self,
             relation_name=GRAFANA_DASHBOARD_INTEGRATION_NAME,
@@ -282,6 +304,16 @@ class HydraCharm(CharmBase):
         # tracing
         self.framework.observe(self.tracing_requirer.on.endpoint_changed, self._on_config_changed)
         self.framework.observe(self.tracing_requirer.on.endpoint_removed, self._on_config_changed)
+
+        # receive-ca-cert -- TEST SCAFFOLDING, not production; see STATUS.md "Path B"
+        self.framework.observe(
+            self.certificate_transfer_requirer.on.certificate_set_updated,
+            self._on_holistic_handler,
+        )
+        self.framework.observe(
+            self.certificate_transfer_requirer.on.certificates_removed,
+            self._on_holistic_handler,
+        )
 
         # resource patching
         self.framework.observe(
@@ -552,6 +584,14 @@ class HydraCharm(CharmBase):
             event.defer()
             return
 
+        # TEST SCAFFOLDING, not production -- see STATUS.md "Path B" / TLSCertificates.
+        # Must run before the pebble plan below: pebble caches the workload container's
+        # cert pool on first TLS handshake, so a CA arriving after that point is never
+        # picked up (see CLAUDE.md's "Go cert-pool caching" blocker).
+        self._workload_service.push_ca_certs(
+            TLSCertificates.load(self.certificate_transfer_requirer).ca_bundle
+        )
+
         config_file = ConfigFile.from_sources(
             self.hydra_secrets,
             self.charm_config,
@@ -570,6 +610,9 @@ class HydraCharm(CharmBase):
         self._update_oauth_provider_info()
         self._oauth_reconciler.garbage_collect()
         self._reconcile_oauth_clients()
+        configure_security_otlp_log_forwarding(
+            self._container, self.security_otlp_requirer, WORKLOAD_SERVICE
+        )
 
     def _on_pebble_check_failed(self, event: PebbleCheckFailedEvent) -> None:
         if event.info.name == PEBBLE_READY_CHECK_NAME:
