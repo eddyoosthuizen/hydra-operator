@@ -14,6 +14,7 @@ from cli import CommandLine, error_summary
 from configs import ConfigFile
 from constants import (
     ADMIN_PORT,
+    CA_BUNDLE_PATH,
     CONFIG_FILE_NAME,
     HYDRA_SERVICE_COMMAND,
     PEBBLE_ALIVE_CHECK_NAME,
@@ -124,6 +125,10 @@ class WorkloadService:
     def open_port(self) -> None:
         self._unit.open_port(protocol="tcp", port=ADMIN_PORT)
         self._unit.open_port(protocol="tcp", port=PUBLIC_PORT)
+
+    def push_ca_certs(self, ca_certs: str) -> None:
+        """TEST SCAFFOLDING, not production -- see STATUS.md "Path B" / TLSCertificates."""
+        self._container.push(str(CA_BUNDLE_PATH), ca_certs, make_dirs=True)
 
 
 class PebbleService:

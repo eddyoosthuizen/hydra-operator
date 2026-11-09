@@ -3,11 +3,16 @@
 
 import json
 import logging
+import subprocess
 from dataclasses import asdict, dataclass, field
 from typing import Any, KeysView, Optional, Type, TypeAlias, Union
 from urllib.parse import quote, urlparse
 
 import dacite
+from charmlibs.interfaces.security_otlp import SecurityOtlpRequirer
+from charms.certificate_transfer_interface.v1.certificate_transfer import (
+    CertificateTransferRequires,
+)
 from charms.data_platform_libs.v0.data_interfaces import DatabaseRequires
 from charms.hydra.v0.hydra_token_hook import AuthIn, HydraHookRequirer
 from charms.identity_platform_login_ui_operator.v0.login_ui_endpoints import (
@@ -16,18 +21,25 @@ from charms.identity_platform_login_ui_operator.v0.login_ui_endpoints import (
 from charms.tempo_coordinator_k8s.v0.tracing import TracingEndpointRequirer
 from charms.traefik_k8s.v0.traefik_route import TraefikRouteRequirer
 from jinja2 import Template
-from ops.model import Model
+from ops.model import Container, Model
+from ops.pebble import Layer
 from yarl import URL
 
 from configs import ServiceConfigs
 from constants import (
     ADMIN_PORT,
+    CA_BUNDLE_PATH,
+    INTEGRATION_CA_BUNDLE_PATH,
     INTERNAL_ROUTE_INTEGRATION_NAME,
     MIGRATION_VERSION_KEY_PREFIX,
     PEER_INTEGRATION_NAME,
     POSTGRESQL_DSN_TEMPLATE,
     PUBLIC_PORT,
     PUBLIC_ROUTE_INTEGRATION_NAME,
+    SECURITY_OTLP_FILTER_BINARY_PATH,
+    SECURITY_OTLP_FILTER_POLICY,
+    SECURITY_OTLP_FILTER_SERVICE,
+    SECURITY_OTLP_FILTER_SOURCE_PATH,
 )
 from env_vars import EnvVars
 
@@ -357,3 +369,150 @@ class PublicRouteData:
 
     def to_service_configs(self) -> ServiceConfigs:
         return {"public_url": str(self.url)}
+
+
+@dataclass(frozen=True, slots=True)
+class TLSCertificates:
+    """TEST SCAFFOLDING, not production -- see STATUS.md "Path B".
+
+    Mirrors kratos's receive-ca-cert handling verbatim, solely so send-security-otlp's
+    delivery can be exercised against the e2e harness's self-signed CA. hydra is not
+    expected to need this once the provider's ingress presents a publicly-trusted
+    certificate (the decided design); remove this class and its call site then.
+    """
+
+    ca_bundle: str
+
+    @classmethod
+    def load(cls, requirer: CertificateTransferRequires) -> "TLSCertificates":
+        """Fetch the CA certificates from all "receive-ca-cert" integrations.
+
+        Compose the trusted CA certificates in /etc/ssl/certs/ca-certificates.crt.
+        """
+        ca_certs = requirer.get_all_certificates()
+        ca_bundle = "\n".join(sorted(ca_certs))
+
+        if ca_bundle:
+            current_ca_cert = (
+                INTEGRATION_CA_BUNDLE_PATH.read_text()
+                if INTEGRATION_CA_BUNDLE_PATH.exists()
+                else ""
+            )
+            if current_ca_cert != ca_bundle:
+                INTEGRATION_CA_BUNDLE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                INTEGRATION_CA_BUNDLE_PATH.write_text(ca_bundle)
+                subprocess.run(["update-ca-certificates", "--fresh"], check=True)
+        else:
+            if INTEGRATION_CA_BUNDLE_PATH.exists():
+                INTEGRATION_CA_BUNDLE_PATH.unlink(missing_ok=True)
+                subprocess.run(["update-ca-certificates", "--fresh"], check=True)
+
+        return cls(ca_bundle=CA_BUNDLE_PATH.read_text())
+
+
+SECURITY_OTLP_LOG_TARGET_PREFIX = "security-otlp"
+
+
+def _security_otlp_log_target(relation_id: int, endpoint: str, enable: bool) -> dict:
+    name = f"{SECURITY_OTLP_LOG_TARGET_PREFIX}-{relation_id}"
+    return {
+        name: {
+            "override": "replace",
+            # Points at the filter service (below), not "all": confirmed against
+            # Pebble's own Service.LogsTo (research-and-context/pebble/internals/plan/plan.go)
+            # that "all" means every service in the plan, so leaving this as "all" would
+            # forward the real workload's raw, unfiltered output alongside the filtered
+            # copy -- see STATUS.md Next-steps item 4 for the full finding.
+            "services": (
+                [SECURITY_OTLP_FILTER_SERVICE] if enable else [f"-{SECURITY_OTLP_FILTER_SERVICE}"]
+            ),
+            "type": "opentelemetry",
+            "location": endpoint,
+        }
+    }
+
+
+def _security_otlp_filter_service(real_service_name: str) -> dict:
+    """TEST SCAFFOLDING, not production -- see STATUS.md Next-steps item 4.
+
+    Pebble service definition for the filter binary: tails `real_service_name`'s own
+    captured log stream via Pebble's client API (poc-log-filtering/main.go), applies
+    `SECURITY_OTLP_FILTER_POLICY`, and re-emits only matching lines on its own stdout --
+    which Pebble captures the same way it captures any service, so the log-target above
+    can forward it with no further plumbing. `real_service_name`'s own command is never
+    touched, so the `logging` relation's log-target (LogForwarder, a different vendored
+    library -- see the same STATUS.md item for why its own `services: ["all"]` also
+    needs attention) keeps seeing the full, unfiltered stream.
+    """
+    return {
+        SECURITY_OTLP_FILTER_SERVICE: {
+            "override": "replace",
+            "command": (
+                f"{SECURITY_OTLP_FILTER_BINARY_PATH} "
+                f"-service {real_service_name} -policy {SECURITY_OTLP_FILTER_POLICY}"
+            ),
+            "startup": "enabled",
+        }
+    }
+
+
+def _push_security_otlp_filter_binary(container: Container) -> None:
+    """TEST SCAFFOLDING, not production -- see STATUS.md Next-steps item 4.
+
+    Delivers the filter binary checked into this charm's own src/ into the workload
+    container, unconditionally on every reconcile -- matching push_ca_certs's own
+    established idempotency posture (a plain overwrite, not a skip-if-unchanged check).
+    Stands in for the still-undecided production packaging mechanism (a charm resource
+    or a charmcraft.yaml build part); this is a stopgap, not a design decision.
+    """
+    container.push(
+        str(SECURITY_OTLP_FILTER_BINARY_PATH),
+        SECURITY_OTLP_FILTER_SOURCE_PATH.read_bytes(),
+        permissions=0o755,
+        make_dirs=True,
+    )
+
+
+def configure_security_otlp_log_forwarding(
+    container: Container, requirer: SecurityOtlpRequirer, real_service_name: str
+) -> None:
+    """Forward the workload's security-relevant logs to every related security-otlp endpoint.
+
+    Logs go through a dedicated filter service rather than forwarding everything.
+    Builds one Pebble log-target per related `send-security-otlp` relation -- there can be
+    more than one, since the relation is intentionally unbounded (see the spec). Also
+    disables any previously configured target whose relation is no longer active, so a
+    broken relation stops forwarding rather than continuing to ship logs to a stale
+    endpoint.
+    """
+    active_endpoints = requirer.endpoints
+
+    targets: dict = {}
+    for relation_id, endpoint in active_endpoints.items():
+        targets.update(_security_otlp_log_target(relation_id, endpoint.endpoint, enable=True))
+
+    existing_targets = container.get_plan().to_dict().get("log-targets", {})
+    for name in existing_targets:
+        if not name.startswith(f"{SECURITY_OTLP_LOG_TARGET_PREFIX}-"):
+            continue
+        relation_id = int(name.removeprefix(f"{SECURITY_OTLP_LOG_TARGET_PREFIX}-"))
+        if relation_id not in active_endpoints:
+            targets.update(_security_otlp_log_target(relation_id, "(removed)", enable=False))
+
+    if not targets:
+        return
+
+    _push_security_otlp_filter_binary(container)
+
+    layer = Layer(
+        {
+            "services": _security_otlp_filter_service(real_service_name),
+            "log-targets": targets,
+        }
+    )
+    container.add_layer("security-otlp-log-forwarding", layer, combine=True)
+    # add_layer() alone only updates pebble's plan -- it does not start the new
+    # "security-otlp-filter" service. replan() is what PebbleService.plan() (services.py)
+    # already relies on for the primary service; needed here for the same reason, or the
+    # filter service is defined but never actually runs.
+    container.replan()
