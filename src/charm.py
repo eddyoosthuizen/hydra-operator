@@ -246,6 +246,14 @@ class HydraCharm(CharmBase):
         self.framework.observe(self.token_hook.on.ready, self._on_holistic_handler)
         self.framework.observe(self.token_hook.on.unavailable, self._on_holistic_handler)
 
+        # security-otlp
+        self.framework.observe(
+            self.on[SECURITY_OTLP_INTEGRATION_NAME].relation_changed, self._on_holistic_handler
+        )
+        self.framework.observe(
+            self.on[SECURITY_OTLP_INTEGRATION_NAME].relation_broken, self._on_holistic_handler
+        )
+
         # database
         self.framework.observe(
             self.database_requirer.on.database_created, self._on_holistic_handler

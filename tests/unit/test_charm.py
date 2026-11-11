@@ -26,6 +26,8 @@ from constants import (
     PEBBLE_READY_CHECK_NAME,
     PEER_INTEGRATION_NAME,
     PUBLIC_ROUTE_INTEGRATION_NAME,
+    SECURITY_OTLP_FILTER_SERVICE,
+    SECURITY_OTLP_INTEGRATION_NAME,
     WORKLOAD_CONTAINER,
     WORKLOAD_SERVICE,
 )
@@ -998,6 +1000,93 @@ class TestTokenHookUnavailableEvent:
         )
 
         mocked_holistic_handler.assert_called_once()
+
+
+SECURITY_OTLP_ENDPOINT = "https://collector.example:4319"
+
+
+def security_otlp_relation_with_endpoint() -> Relation:
+    return Relation(
+        SECURITY_OTLP_INTEGRATION_NAME,
+        remote_app_data={
+            "endpoints": json.dumps([{"protocol": "http", "endpoint": SECURITY_OTLP_ENDPOINT}])
+        },
+    )
+
+
+class TestSecurityOtlpChangedEvent:
+    """Tests for the security-otlp relation changed event."""
+
+    def test_when_event_emitted(
+        self,
+        context: Context,
+        mocked_holistic_handler: MagicMock,
+    ) -> None:
+        """Test that a published or changed collector endpoint triggers the holistic handler."""
+        security_otlp_relation = security_otlp_relation_with_endpoint()
+        state = create_state(relations=[security_otlp_relation])
+
+        context.run(context.on.relation_changed(security_otlp_relation), state)
+
+        mocked_holistic_handler.assert_called_once()
+
+
+class TestSecurityOtlpBrokenEvent:
+    """Tests for the security-otlp relation broken event."""
+
+    def test_when_event_emitted(
+        self,
+        context: Context,
+        mocked_holistic_handler: MagicMock,
+    ) -> None:
+        """Test that removing the collector relation triggers the holistic handler."""
+        security_otlp_relation = Relation(SECURITY_OTLP_INTEGRATION_NAME)
+        state = create_state(relations=[security_otlp_relation])
+
+        context.run(context.on.relation_broken(security_otlp_relation), state)
+
+        mocked_holistic_handler.assert_called_once()
+
+    def test_stops_forwarding_to_the_removed_collector(
+        self,
+        context: Context,
+        public_route_relation_ready: Relation,
+        login_ui_relation_ready: Relation,
+        db_relation_ready: Relation,
+        peer_relation_ready: PeerRelation,
+    ) -> None:
+        """Test that the log-target for a removed collector is disabled, not left shipping."""
+        security_otlp_relation = security_otlp_relation_with_endpoint()
+        state = create_state(
+            relations=[
+                peer_relation_ready,
+                db_relation_ready,
+                public_route_relation_ready,
+                login_ui_relation_ready,
+                security_otlp_relation,
+            ]
+        )
+        target_name = f"security-otlp-{security_otlp_relation.id}"
+        filter_binary = MagicMock(spec=Path)
+        filter_binary.read_bytes.return_value = b"filter binary"
+
+        with (
+            patch("charm.ConfigFile.from_sources", return_value=ConfigFile("config")),
+            patch("charm.NOOP_CONDITIONS", new=[]),
+            patch("charm.WorkloadService.is_running", return_value=True),
+            patch("integrations.SECURITY_OTLP_FILTER_SOURCE_PATH", new=filter_binary),
+        ):
+            related = context.run(context.on.relation_changed(security_otlp_relation), state)
+            removed = context.run(
+                context.on.relation_broken(related.get_relation(security_otlp_relation.id)),
+                related,
+            )
+
+        related_target = related.get_container(WORKLOAD_CONTAINER).plan.log_targets[target_name]
+        assert related_target.location == SECURITY_OTLP_ENDPOINT
+        assert related_target.services == [SECURITY_OTLP_FILTER_SERVICE]
+        removed_target = removed.get_container(WORKLOAD_CONTAINER).plan.log_targets[target_name]
+        assert removed_target.services == [f"-{SECURITY_OTLP_FILTER_SERVICE}"]
 
 
 class TestOAuthIntegrationCreatedEvent:
