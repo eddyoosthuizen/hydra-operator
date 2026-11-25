@@ -1,6 +1,7 @@
 # Copyright 2024 Canonical Ltd.
 # See LICENSE file for licensing details.
 
+import copy
 from unittest.mock import MagicMock
 
 import pytest
@@ -12,11 +13,12 @@ from constants import (
     CONFIG_FILE_NAME,
     PEBBLE_ALIVE_CHECK_NAME,
     PEBBLE_READY_CHECK_NAME,
+    WORKLOAD_CONTAINER,
     WORKLOAD_SERVICE,
 )
 from env_vars import DEFAULT_CONTAINER_ENV, EnvVarConvertible
 from exceptions import PebbleServiceError
-from services import PebbleService, WorkloadService
+from services import PEBBLE_LAYER_DICT, PebbleService, WorkloadService, plan_contains_layer
 
 
 class TestWorkloadService:
@@ -255,6 +257,22 @@ class TestPebbleService:
         # Replan does not start a stopped service; one that is backing off is left to Pebble
         assert mock_container.start.called is started
 
+    def test_plan_skips_add_layer_when_the_plan_already_has_the_layer(
+        self, mock_container: MagicMock, pebble_service: PebbleService
+    ) -> None:
+        layer = {"services": {"hydra": {"override": "replace", "command": "hydra serve"}}}
+        mock_container.get_plan.return_value.to_dict.return_value = {
+            "services": {"hydra": {"override": "replace", "command": "hydra serve"}}
+        }
+        mock_file_cm = MagicMock()
+        mock_file_cm.__enter__.return_value.read.return_value = "config_file"
+        mock_container.pull.return_value = mock_file_cm
+
+        pebble_service.plan(layer, config_file=ConfigFile("config_file"))
+
+        mock_container.add_layer.assert_not_called()
+        mock_container.replan.assert_called_once()
+
     def test_plan_error_leaves_out_the_service_output(
         self, mock_container: MagicMock, pebble_service: PebbleService
     ) -> None:
@@ -282,7 +300,10 @@ class TestPebbleService:
         getattr(mock_container, failing_call).side_effect = ConnectionError("socket not found")
 
         with pytest.raises(PebbleServiceError):
-            pebble_service.plan({"services": {}}, config_file=ConfigFile("config_file"))
+            pebble_service.plan(
+                {"services": {"hydra": {"override": "replace"}}},
+                config_file=ConfigFile("config_file"),
+            )
 
     def test_render_pebble_layer(self, pebble_service: PebbleService) -> None:
         data_source = MagicMock(spec=EnvVarConvertible)
@@ -323,3 +344,80 @@ class TestPebbleService:
                 }
             }
         }
+
+
+class TestPlanContainsLayer:
+    @staticmethod
+    def container_with_plan(plan: dict) -> MagicMock:
+        container = MagicMock(spec=Container)
+        container.get_plan.return_value.to_dict.return_value = plan
+        return container
+
+    @staticmethod
+    def hydra_layer() -> dict:
+        """PEBBLE_LAYER_DICT without the environment that render_pebble_layer writes into it."""
+        layer = copy.deepcopy(PEBBLE_LAYER_DICT)
+        layer["services"][WORKLOAD_CONTAINER].pop("environment", None)
+        return layer
+
+    @classmethod
+    def hydra_plan(cls) -> dict:
+        """The plan Pebble reports for the hydra layer: its defaults added, summaries not."""
+        layer = cls.hydra_layer()
+        plan = {"services": layer["services"], "checks": layer["checks"]}
+        plan["checks"][PEBBLE_ALIVE_CHECK_NAME]["threshold"] = 3
+        return plan
+
+    def test_true_when_the_plan_holds_the_layer_plus_pebble_defaults(self) -> None:
+        container = self.container_with_plan(self.hydra_plan())
+
+        assert plan_contains_layer(container, self.hydra_layer())
+
+    def test_true_when_environment_values_differ_only_in_type(self) -> None:
+        layer = {
+            "services": {
+                "hydra": {
+                    "override": "replace",
+                    "environment": {"TRACING_ENABLED": False, "DEV": "true", "PORT": 4444},
+                }
+            }
+        }
+        container = self.container_with_plan({
+            "services": {
+                "hydra": {
+                    "override": "replace",
+                    "environment": {"TRACING_ENABLED": "false", "DEV": "true", "PORT": "4444"},
+                }
+            }
+        })
+
+        assert plan_contains_layer(container, layer)
+
+    def test_false_when_a_service_setting_differs(self) -> None:
+        plan = self.hydra_plan()
+        plan["services"][WORKLOAD_CONTAINER]["command"] = "hydra serve --old"
+        container = self.container_with_plan(plan)
+
+        assert not plan_contains_layer(container, self.hydra_layer())
+
+    def test_false_when_the_plan_keeps_an_environment_variable_the_layer_dropped(self) -> None:
+        layer = {"services": {"hydra": {"override": "replace", "environment": {"A": "1"}}}}
+        container = self.container_with_plan({
+            "services": {"hydra": {"override": "replace", "environment": {"A": "1", "B": "2"}}}
+        })
+
+        assert not plan_contains_layer(container, layer)
+
+    def test_false_when_the_plan_lacks_an_entry_of_the_layer(self) -> None:
+        plan = self.hydra_plan()
+        del plan["checks"][PEBBLE_READY_CHECK_NAME]
+        container = self.container_with_plan(plan)
+
+        assert not plan_contains_layer(container, self.hydra_layer())
+
+    def test_false_when_a_check_has_lost_its_level(self) -> None:
+        plan = self.hydra_plan()
+        del plan["checks"][PEBBLE_ALIVE_CHECK_NAME]["level"]
+        container = self.container_with_plan(plan)
+
+        assert not plan_contains_layer(container, self.hydra_layer())
