@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from ops.model import Container, ModelError, Unit
-from ops.pebble import ChangeError, CheckStatus, ConnectionError, ServiceStatus
+from ops.pebble import ChangeError, CheckStatus, ConnectionError, Layer, ServiceStatus
 
 from configs import ConfigFile
 from constants import (
@@ -16,7 +16,7 @@ from constants import (
 )
 from env_vars import DEFAULT_CONTAINER_ENV, EnvVarConvertible
 from exceptions import PebbleServiceError
-from services import PebbleService, WorkloadService
+from services import PebbleService, WorkloadService, plan_contains_layer
 
 
 class TestWorkloadService:
@@ -255,6 +255,58 @@ class TestPebbleService:
         # Replan does not start a stopped service; one that is backing off is left to Pebble
         assert mock_container.start.called is started
 
+    def test_plan_contains_layer_compares_what_the_layer_sets(
+        self, mock_container: MagicMock
+    ) -> None:
+        layer = Layer({
+            "services": {
+                WORKLOAD_SERVICE: {
+                    "override": "replace",
+                    "command": "hydra serve",
+                    "environment": {"DEBUG": True},
+                }
+            },
+            "checks": {"up": {"override": "replace", "http": {"url": "http://localhost/health"}}},
+        })
+        mock_container.get_plan.return_value.to_dict.return_value = {
+            "services": {
+                WORKLOAD_SERVICE: {
+                    "override": "replace",
+                    "command": "hydra serve",
+                    "environment": {"DEBUG": "true"},
+                }
+            },
+            "checks": {
+                "up": {
+                    "override": "replace",
+                    "http": {"url": "http://localhost/health"},
+                    "threshold": 3,
+                }
+            },
+        }
+
+        assert plan_contains_layer(mock_container, layer)
+        changed = Layer({
+            "services": {WORKLOAD_SERVICE: {"override": "replace", "command": "hydra migrate"}}
+        })
+        assert not plan_contains_layer(mock_container, changed)
+
+    def test_plan_skips_add_layer_when_the_plan_already_has_the_layer(
+        self, mock_container: MagicMock, pebble_service: PebbleService
+    ) -> None:
+        layer = {"services": {"hydra": {"override": "replace", "command": "hydra serve"}}}
+        mock_container.get_plan.return_value.to_dict.return_value = {
+            "services": {"hydra": {"override": "replace", "command": "hydra serve"}}
+        }
+        mock_file_cm = MagicMock()
+        mock_file_cm.__enter__.return_value.read.return_value = "config_file"
+        mock_container.pull.return_value = mock_file_cm
+
+        pebble_service.plan(layer, config_file=ConfigFile("config_file"))
+
+        mock_container.add_layer.assert_not_called()
+        mock_container.replan.assert_called_once()
+
     def test_plan_error_leaves_out_the_service_output(
         self, mock_container: MagicMock, pebble_service: PebbleService
     ) -> None:
@@ -282,7 +334,10 @@ class TestPebbleService:
         getattr(mock_container, failing_call).side_effect = ConnectionError("socket not found")
 
         with pytest.raises(PebbleServiceError):
-            pebble_service.plan({"services": {}}, config_file=ConfigFile("config_file"))
+            pebble_service.plan(
+                {"services": {"hydra": {"override": "replace"}}},
+                config_file=ConfigFile("config_file"),
+            )
 
     def test_render_pebble_layer(self, pebble_service: PebbleService) -> None:
         data_source = MagicMock(spec=EnvVarConvertible)

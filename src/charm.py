@@ -12,6 +12,7 @@ from functools import cached_property
 from secrets import token_hex
 from typing import Any
 
+from charmlibs.interfaces.log_filters import LogFiltersRequirer
 from charmlibs.interfaces.oauth import OAuthProvider
 from charms.data_platform_libs.v0.data_interfaces import DatabaseRequires
 from charms.grafana_k8s.v0.grafana_dashboard import GrafanaDashboardProvider
@@ -61,6 +62,7 @@ from constants import (
     GRAFANA_DASHBOARD_INTEGRATION_NAME,
     HYDRA_TOKEN_HOOK_INTEGRATION_NAME,
     INTERNAL_ROUTE_INTEGRATION_NAME,
+    LOG_FILTERS_DROP,
     LOGGING_RELATION_NAME,
     LOGIN_UI_INTEGRATION_NAME,
     OAUTH_INTEGRATION_NAME,
@@ -68,6 +70,7 @@ from constants import (
     PEER_INTEGRATION_NAME,
     PROMETHEUS_SCRAPE_INTEGRATION_NAME,
     PUBLIC_ROUTE_INTEGRATION_NAME,
+    SEND_LOG_FILTERS_INTEGRATION_NAME,
     SYSTEM_SECRET,
     TEMPO_TRACING_INTEGRATION_NAME,
     WORKLOAD_CONTAINER,
@@ -205,6 +208,12 @@ class HydraCharm(CharmBase):
         self.framework.observe(self.on.hydra_pebble_check_failed, self._on_pebble_check_failed)
         self.framework.observe(
             self.on.hydra_pebble_check_recovered, self._on_pebble_check_recovered
+        )
+        self.framework.observe(
+            self.on[SEND_LOG_FILTERS_INTEGRATION_NAME].relation_changed, self._on_holistic_handler
+        )
+        self.framework.observe(
+            self.on[SEND_LOG_FILTERS_INTEGRATION_NAME].relation_broken, self._on_holistic_handler
         )
         self.framework.observe(self.on.update_status, self._on_holistic_handler)
         self.framework.observe(self.on.leader_elected, self._on_holistic_handler)
@@ -643,6 +652,10 @@ class HydraCharm(CharmBase):
         self._holistic_handler(event)
 
     def _holistic_handler(self, event: EventBase) -> None:
+        LogFiltersRequirer(
+            self, SEND_LOG_FILTERS_INTEGRATION_NAME, ottl_drop=LOG_FILTERS_DROP
+        ).publish()
+
         if not self.hydra_secrets.is_ready:
             self._initialize_secrets()
 

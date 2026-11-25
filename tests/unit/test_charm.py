@@ -4,7 +4,7 @@
 import json
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import MagicMock, PropertyMock, call, patch
+from unittest.mock import ANY, MagicMock, PropertyMock, call, patch
 
 import pytest
 from charmlibs.interfaces.oauth import OAuthProvider
@@ -21,11 +21,13 @@ from cli import SchemaState
 from configs import ConfigFile
 from constants import (
     DATABASE_INTEGRATION_NAME,
+    LOG_FILTERS_DROP,
     OAUTH_INTEGRATION_NAME,
     PEBBLE_ALIVE_CHECK_NAME,
     PEBBLE_READY_CHECK_NAME,
     PEER_INTEGRATION_NAME,
     PUBLIC_ROUTE_INTEGRATION_NAME,
+    SEND_LOG_FILTERS_INTEGRATION_NAME,
     WORKLOAD_CONTAINER,
     WORKLOAD_SERVICE,
 )
@@ -93,6 +95,31 @@ class TestLeaderElectedEvent:
         context.run(context.on.leader_elected(), state)
 
         mocked_holistic_handler.assert_called_once()
+
+
+class TestLogFiltersRelationChangedEvent:
+    def test_when_event_emitted(
+        self, context: Context, mocked_holistic_handler: MagicMock
+    ) -> None:
+        relation = Relation(SEND_LOG_FILTERS_INTEGRATION_NAME)
+        state = create_state(relations=[relation], can_connect=False)
+
+        context.run(context.on.relation_changed(relation), state)
+
+        mocked_holistic_handler.assert_called_once()
+
+
+class TestHolisticHandlerLogFilters:
+    def test_when_the_charm_is_not_ready(self, context: Context) -> None:
+        state = create_state(can_connect=False)
+
+        with patch("charm.LogFiltersRequirer") as mocked_requirer:
+            context.run(context.on.update_status(), state)
+
+        mocked_requirer.assert_called_once_with(
+            ANY, SEND_LOG_FILTERS_INTEGRATION_NAME, ottl_drop=LOG_FILTERS_DROP
+        )
+        mocked_requirer.return_value.publish.assert_called_once()
 
 
 class TestConfigChangeEvent:

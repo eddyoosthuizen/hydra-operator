@@ -19,6 +19,8 @@ dependencies = [
     "lightkube~=1.0.0",
     "lightkube-models~=1.37.0.8",
     "yarl",
+    # TODO: a PyPI version once released.
+    "charmlibs-interfaces-log-filters @ git+https://github.com/eddyoosthuizen/charmlibs.git@log-filters#subdirectory=interfaces/log_filters",
 ]
 
 [dependency-groups]
